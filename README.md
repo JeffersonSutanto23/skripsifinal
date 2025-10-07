@@ -1,0 +1,2 @@
+# skripsifinal
+code skripsi
