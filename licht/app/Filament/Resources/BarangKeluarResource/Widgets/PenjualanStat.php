@@ -4,32 +4,30 @@ namespace App\Filament\Widgets;
 
 use Filament\Widgets\StatsOverviewWidget as BaseWidget;
 use Filament\Widgets\StatsOverviewWidget\Stat;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Filament\Notifications\Notification;
+use App\Filament\Resources\BarangResource;
+use Filament\Notifications\Actions\Action as NotificationAction;
 use Illuminate\Support\Str;
 use Carbon\Carbon;
 
 class PenjualanStat extends BaseWidget
 {
-    // Auto refresh setiap 5 detik (opsional, bisa dihapus jika tidak perlu)
     protected static ?string $pollingInterval = '10s';
-    
-    // Heading dan grid
+
     public function getHeading(): string
     {
         $now = Carbon::now();
         return 'Statistik Penjualan ' . $now->translatedFormat('F Y');
     }
-    
+
     protected array|string|int $columnSpan = 4;
 
-    /**
-     * Cek apakah user saat ini boleh melihat widget ini.
-     */
     public static function canView(): bool
     {
         $user = auth()->user();
-
-        if (! $user) {
+        if (!$user) {
             return false;
         }
 
@@ -56,65 +54,133 @@ class PenjualanStat extends BaseWidget
         return false;
     }
 
+    public function mount(): void
+    {
+        $rows = DB::table('barangs')
+            ->select('namabarang', 'stock')
+            ->orderByDesc('stock')
+            ->limit(50)
+            ->get();
+
+        $low = $rows->filter(fn ($r) => (int) $r->stock < 20);
+        if ($low->isEmpty()) {
+            return;
+        }
+
+        $userId = auth()->id() ?? 'guest';
+        $key    = 'dash_low_stock:' . $userId . ':' . md5(url()->current());
+
+        if (! Cache::add($key, true, now()->addSeconds(60))) {
+            return;
+        }
+
+        $show    = $low->pluck('namabarang')->take(5)->implode(', ');
+        $moreTxt = $low->count() > 5 ? ' dan ' . ($low->count() - 5) . ' barang lainnya' : '';
+
+        Notification::make()
+            ->title('Stok menipis')
+            ->body("Ada barang yang stoknya menipis: {$show}{$moreTxt}.")
+            ->danger()
+            ->actions([
+                NotificationAction::make('Lihat daftar')
+                    ->url(BarangResource::getUrl())
+                    ->button(),
+            ])
+            ->send();
+    }
+
     protected function getStats(): array
     {
         $now = Carbon::now();
 
-        // ===========================================
-        // 1. Perhitungan Modal Terpakai (HPP) Bulan Ini
-        // HANYA menggunakan harga beli dari barang masuk BULAN INI
-        // ===========================================
-        
-        // Ambil harga beli HANYA dari bulan ini
-        $costMapBulanIni = DB::table('barangmasuks')
-            ->whereMonth('tanggalmasuk', $now->month)
-            ->whereYear('tanggalmasuk', $now->year)
-            ->select('namabarang', DB::raw('SUM(totalhargabeli) / NULLIF(SUM(jumlahmasuk),0) AS modal_satuan'))
-            ->groupBy('namabarang')
-            ->pluck('modal_satuan', 'namabarang');
+        // ==========================================================
+        // 1. Ambil harga beli terbaru bulan ini per barang
+        // ==========================================================
+        $costMapNow = DB::table('barangmasuks as bm')
+            ->select('bm.namabarang', 'bm.hargabelieceran')
+            ->where('bm.keterangan', '!=', 'masih dalam proses')
+            ->whereMonth('bm.tanggalmasuk', $now->month)
+            ->whereYear('bm.tanggalmasuk', $now->year)
+            ->whereRaw('bm.tanggalmasuk = (
+                SELECT MAX(bm2.tanggalmasuk)
+                FROM barangmasuks bm2
+                WHERE bm2.namabarang = bm.namabarang
+                  AND bm2.keterangan != "masih dalam proses"
+                  AND MONTH(bm2.tanggalmasuk) = ?
+                  AND YEAR(bm2.tanggalmasuk) = ?
+            )', [$now->month, $now->year])
+            ->pluck('bm.hargabelieceran', 'bm.namabarang')
+            ->map(fn($v) => (float) $v)
+            ->toArray();
 
-        // Jika barang tidak ada di bulan ini, ambil dari data terakhir sebelum bulan ini
-        $costMapSebelumnya = DB::table('barangmasuks')
-            ->where('tanggalmasuk', '<', $now->startOfMonth())
-            ->select('namabarang', DB::raw('SUM(totalhargabeli) / NULLIF(SUM(jumlahmasuk),0) AS modal_satuan'))
-            ->groupBy('namabarang')
-            ->pluck('modal_satuan', 'namabarang');
+        // ==========================================================
+        // 2. Ambil harga beli terakhir sebelum bulan ini
+        // ==========================================================
+        $costMapLast = DB::table('barangmasuks as bm')
+            ->select('bm.namabarang', 'bm.hargabelieceran')
+            ->where('bm.keterangan', '!=', 'masih dalam proses')
+            ->whereRaw('bm.tanggalmasuk = (
+                SELECT MAX(bm2.tanggalmasuk)
+                FROM barangmasuks bm2
+                WHERE bm2.namabarang = bm.namabarang
+                  AND bm2.keterangan != "masih dalam proses"
+                  AND bm2.tanggalmasuk < ?
+            )', [$now->startOfMonth()])
+            ->pluck('bm.hargabelieceran', 'bm.namabarang')
+            ->map(fn($v) => (float) $v)
+            ->toArray();
 
-        // Gabungkan: prioritas harga bulan ini, fallback ke harga sebelumnya
-        $costMap = $costMapBulanIni->merge($costMapSebelumnya->diffKeys($costMapBulanIni));
-
-        $dataBarangKeluar = DB::table('barangkeluars')
+        // ==========================================================
+        // 3. Ambil data barang keluar bulan ini (selesai)
+        // ==========================================================
+        $barangKeluar = DB::table('barangkeluars')
+            ->where('keterangan', '!=', 'masih dalam proses')
             ->whereMonth('tanggalkeluar', $now->month)
             ->whereYear('tanggalkeluar', $now->year)
             ->get();
 
+        // ==========================================================
+        // 4. Hitung HPP (logika: jika ada modal bulan ini pakai itu, jika tidak, pakai terakhir sebelumnya)
+        // ==========================================================
         $hppBulanIni = 0;
-        foreach ($dataBarangKeluar as $r) {
-            $qty         = (int) ($r->jumlahkeluar ?? 0);
-            $modalSatuan = (float) ($costMap[$r->namabarang] ?? 0);
-            $hppBulanIni += (int) round($modalSatuan * $qty);
+
+        foreach ($barangKeluar as $item) {
+            $qty = (int) ($item->jumlahkeluar ?? 0);
+            $hargaBeli = $costMapNow[$item->namabarang]
+                ?? $costMapLast[$item->namabarang]
+                ?? 0;
+
+            $hppBulanIni += $qty * (float) $hargaBeli;
         }
 
-        // ===========================================
-        // 2. Perhitungan Total Modal Masuk Bulan Ini
-        // ===========================================
+        // ==========================================================
+        // 5. Total modal masuk bulan ini (selesai)
+        // ==========================================================
         $totalModalMasukBulanIni = DB::table('barangmasuks')
             ->whereMonth('tanggalmasuk', $now->month)
             ->whereYear('tanggalmasuk', $now->year)
+            ->where('keterangan', '!=', 'masih dalam proses')
             ->sum('totalhargabeli');
 
-        // ===========================================
-        // 3. Statistik Penjualan & Keuntungan
-        // ===========================================
+        // ==========================================================
+        // 6. Total penjualan bulan ini (selesai)
+        // ==========================================================
         $totalPenjualan = DB::table('barangkeluars')
+            ->where('keterangan', '!=', 'masih dalam proses')
             ->whereMonth('tanggalkeluar', $now->month)
             ->whereYear('tanggalkeluar', $now->year)
             ->sum(DB::raw('jumlahkeluar * hargajualeceran'));
 
+        // ==========================================================
+        // 7. Hitung laba/rugi bersih
+        // ==========================================================
         $totalKeuntungan = $totalPenjualan - $hppBulanIni;
-        $profitColor     = $totalKeuntungan >= 0 ? 'success' : 'danger';
-        $profitIcon      = $totalKeuntungan >= 0 ? 'heroicon-o-arrow-trending-up' : 'heroicon-o-arrow-trending-down';
+        $profitColor = $totalKeuntungan >= 0 ? 'success' : 'danger';
+        $profitIcon  = $totalKeuntungan >= 0 ? 'heroicon-o-arrow-trending-up' : 'heroicon-o-arrow-trending-down';
 
+        // ==========================================================
+        // 8. Return hasil statistik
+        // ==========================================================
         return [
             Stat::make('Total Keuntungan', 'Rp ' . number_format($totalKeuntungan, 0, ',', '.'))
                 ->description('Laba/Rugi bersih bulan ' . $now->translatedFormat('F'))
@@ -122,12 +188,12 @@ class PenjualanStat extends BaseWidget
                 ->color($profitColor),
 
             Stat::make('Total Modal Bulan Ini', 'Rp ' . number_format($totalModalMasukBulanIni, 0, ',', '.'))
-                ->description('Total biaya pembelian bulan ' . $now->translatedFormat('F'))
+                ->description('Total pembelian bulan ' . $now->translatedFormat('F'))
                 ->descriptionIcon('heroicon-m-shopping-bag')
                 ->color('warning'),
 
             Stat::make('Total Penjualan', 'Rp ' . number_format($totalPenjualan, 0, ',', '.'))
-                ->description('Pendapatan kotor bulan ' . $now->translatedFormat('F'))
+                ->description('Total Pendapatan bulan ' . $now->translatedFormat('F'))
                 ->descriptionIcon('heroicon-m-banknotes')
                 ->color('primary'),
 

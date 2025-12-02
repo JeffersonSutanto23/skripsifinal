@@ -63,10 +63,15 @@ class BarangResource extends Resource
                 ->visibleOn('edit'),
             Forms\Components\TextInput::make('name')
                 ->label('Dikelola oleh')
-                ->default(fn () => Auth::user()->name ?? '-')
-                ->disabled() // tidak bisa diubah
-                ->dehydrated() // tetap tersimpan di DB
-                ->required(),
+                ->disabled()
+                ->dehydrated()
+                ->required()
+                ->afterStateHydrated(function ($component, $state) {
+                    // selalu isi sesuai user login saat form dimuat (create/edit)
+                    $component->state(Auth::user()->name ?? '-');
+                    
+    })
+
             ]);
     }
 

@@ -76,13 +76,4 @@ class BarangKeluar extends Model
     'tanggalkeluar' => 'datetime', // atau 'date' kalau tipenya DATE
 ];
 
-public function barang()
-{
-    return $this->belongsTo(Barang::class, 'namabarang', 'namabarang');
-}
-
-public function pelanggan()
-{
-    return $this->belongsTo(Pelanggan::class, 'namapelanggan', 'namapelanggan');
-}
 }
